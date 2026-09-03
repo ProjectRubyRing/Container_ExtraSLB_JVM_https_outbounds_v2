@@ -32,6 +32,7 @@ back/Dockerfile                        # 同上
 docs/certificate-management-strategies.md
 docs/standalone-xml-history-ecs-vs-compose.md   # ECS だけ異常終了する履歴ローテーション問題の原因と修正
 docs/shortest-fix-safety-analysis.md            # 「最短の打ち手」の安全性・十分性の論理検証
+docs/minimal-fix-rm-history-only.md             # 「rm -rf standalone_xml_history の 1 行だけ」で足りるかの要約
 ```
 
 ## 信頼設定の 2 層構え (どの HTTP クライアントでも動作させるため)

@@ -11,6 +11,9 @@ RUN rm -rf "${JBOSS_HOME}/standalone/configuration/standalone_xml_history"
 背景と全体像は [standalone-xml-history-ecs-vs-compose.md](./standalone-xml-history-ecs-vs-compose.md)
 の 13〜18 章を参照。
 
+> **「この 1 行だけの最小対応で足りるか」という観点での要約は
+> [minimal-fix-rm-history-only.md](./minimal-fix-rm-history-only.md) にある。**
+
 ---
 
 ## 0. 結論 — 先に答える
