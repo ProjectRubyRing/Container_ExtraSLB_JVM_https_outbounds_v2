@@ -1,0 +1,8 @@
+# extraslb から受領した証明書はリポジトリにコミットしない
+secrets/
+*.pem
+*.crt
+*.p12
+
+# cacert-secret-args.sh が生成する受け渡し用アーカイブ (中身は証明書)
+cacerts-bundle.tar

@@ -1,0 +1,49 @@
+# ==================================================================
+# アウトバウンド HTTPS (自己署名証明書) の Elytron 設定
+#
+# 参照するトラストストアは extraslb / others など複数ソースの CA 証明書を
+# まとめて取り込んだ 1 ファイル (ビルド時に build-truststore.sh が生成)。
+# 証明書ソースが増えても本ファイルの変更は不要。
+#
+# 本ファイルは entrypoint.sh が実行時に
+#   embed-server --server-config=<SERVER_CONFIG> --std-out=echo
+#   (本ファイルの内容)
+#   stop-embedded-server
+# の形に組み立てて jboss-cli.sh --file= で実行する (本体のみを記述)。
+#
+# ポイント:
+#   - if/end-if による冪等化。コンテナ再起動で設定済み standalone.xml に
+#     対して再実行されても安全。
+#   - ${env.*} 式は CLI では解決されず standalone.xml に式のまま保存され、
+#     サーバ起動時に環境変数で解決される (パス・パスワードの外部化)。
+# ==================================================================
+
+# --- 1. トラストストア (受領した CA 証明書群 + JDK cacerts) の登録 ---
+if (outcome != success) of /subsystem=elytron/key-store=extraslb-trust-store:read-resource
+    /subsystem=elytron/key-store=extraslb-trust-store:add( \
+        path="${env.EXTRASLB_TRUSTSTORE_PATH:/opt/app/security/extraslb-truststore.p12}", \
+        type="${env.EXTRASLB_TRUSTSTORE_TYPE:PKCS12}", \
+        credential-reference={clear-text="${env.EXTRASLB_TRUSTSTORE_PASSWORD:changeit}"} \
+    )
+end-if
+
+# --- 2. トラストマネージャの登録 ---
+if (outcome != success) of /subsystem=elytron/trust-manager=extraslb-trust-manager:read-resource
+    /subsystem=elytron/trust-manager=extraslb-trust-manager:add( \
+        key-store=extraslb-trust-store \
+    )
+end-if
+
+# --- 3. クライアント SSL コンテキストの登録 (アウトバウンド TLS 用) ---
+if (outcome != success) of /subsystem=elytron/client-ssl-context=extraslb-client-ssl-context:read-resource
+    /subsystem=elytron/client-ssl-context=extraslb-client-ssl-context:add( \
+        trust-manager=extraslb-trust-manager, \
+        protocols=["TLSv1.3","TLSv1.2"] \
+    )
+end-if
+
+# --- 4. JVM 既定の SSLContext として登録 ---
+# これにより SSLContext.getDefault() / HttpsURLConnection / JAX-RS Client 等、
+# 既定 SSLContext を使う実装は取り込んだ全ての自己署名証明書を信頼する。
+# (write-attribute は冪等のためガード不要)
+/subsystem=elytron:write-attribute(name=default-ssl-context, value=extraslb-client-ssl-context)

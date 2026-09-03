@@ -1,0 +1,5 @@
+# コンテナ内 (Linux) で実行されるファイルは常に LF を維持する
+*.sh   text eol=lf
+*.cli  text eol=lf
+Dockerfile text eol=lf
+*.md   text eol=lf
