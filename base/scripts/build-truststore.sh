@@ -2,7 +2,7 @@
 #
 # build-truststore.sh <cacert-archive|cacert-dir|cacert-file> <output-p12> <store-password> [source-name]
 #
-# コンテナビルド時に実行し、受領した CA 証明書 (cacert.crt) を
+# コンテナビルド時に実行し、受領した証明書 (ルート CA / 中間 CA / サーバ証明書) を
 # JDK 標準 cacerts のコピーへ追加した PKCS12 トラストストアを生成する。
 # 複数の提供元 (extraslb / others / ...) の証明書をまとめて 1 つの
 # トラストストアへ取り込める。
@@ -15,9 +15,10 @@
 #                    受け取るビルド時取り込み方式はこれを使う。
 #                    → ソースが増えても Dockerfile の変更は不要。
 #   ディレクトリ   … 次の 2 レイアウトを受け付ける (混在も可)。
-#                    (a) <dir>/<name>/<any>.crt … サブディレクトリ名がソース名
+#                    (a) <dir>/<name>/<任意のファイル名> … サブディレクトリ名がソース名
 #                          certs/extraslb/cacert.crt -> extraslb-ca-1, extraslb-ca-2, ...
-#                          certs/others/cacert.crt   -> others-ca-1, ...
+#                          certs/others/rootCA.pem   -> others-ca-1, ...
+#                        ファイル名・拡張子は問わない (形式は中身で判定する)。
 #                        1 ソースに複数ファイルを置いた場合もエイリアスは
 #                        そのソース内で連番が継続する (extraslb-ca-3, ...)。
 #                    (b) <dir>/<name>.crt        … ファイル名 (拡張子を除く) がソース名
@@ -27,9 +28,20 @@
 #                    (既定: extraslb)。
 #
 # 共通の前提:
-#   - cacert.crt は PEM (Base64 テキスト) / DER (バイナリ) のどちらでもよい。
-#     拡張子ではなくファイルの中身から形式を自動判別する。
-#   - PEM で複数証明書 (チェーン) が連結されていても全て取り込む
+#   - ファイル名・拡張子は問わない (cacert.crt でなくてよい)。形式は中身から判定する。
+#   - 受け付ける形式: PEM (Base64 テキスト) / DER (バイナリ) / PKCS#7 バンドル
+#     (.p7b/.p7c 相当。DER・PEM どちらの包装でも可)。
+#   - 複数証明書が 1 ファイルに束ねられていても (PEM 連結・PKCS#7)、
+#     1 枚ずつに分割して全て取り込む。
+#   - 証明書の種類も問わない。ルート CA / 中間 CA / サーバ (エンドエンティティ)
+#     証明書のいずれもトラストストアへ取り込める。
+#       ルート CA    … 通常の信頼アンカー。その CA 配下のサーバ証明書を検証できる。
+#       中間 CA      … サーバがチェーンを提示しない場合や、信頼範囲をその中間 CA
+#                      配下だけに絞りたい場合に使う。
+#       サーバ証明書 … いわゆる証明書ピンニング。Java の PKIX 実装は提示された
+#                      チェーン中に信頼済み証明書があればそこをアンカーとして扱うため、
+#                      リーフ証明書だけを入れても検証は成立する (更新のたびに再ビルド)。
+#     取り込み時に種別 (root CA / intermediate CA / end-entity) をログへ出す。
 #   - cacerts ベースのため、パブリック CA 宛の HTTPS 通信も引き続き成功する
 set -euo pipefail
 
@@ -60,6 +72,30 @@ trap 'rm -rf "${WORK_DIR}"' EXIT
 # keytool のエイリアスは大文字小文字を区別しないため小文字へ寄せる。
 sanitize_name() {
     printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C tr -c 'a-z0-9._-' '-'
+}
+
+# 証明書の種別 (ルート CA / 中間 CA / エンドエンティティ) を判定する。
+# 判定材料は keytool -printcert の出力:
+#   BasicConstraints の CA:true … CA 証明書
+#   Owner == Issuer             … 自己署名 (ルート)
+# 取り込み可否には影響しない。ビルドログで「意図した種別が入ったか」を
+# 確認するための表示・集計用。
+classify_certificate() {
+    local TEXT="$1" OWNER ISSUER
+    # 先頭 1 件だけを取り出す (head へのパイプは pipefail 下で SIGPIPE を招くため使わない)
+    OWNER="$(LC_ALL=C sed -n '/^Owner: /{s/^Owner: //p;q;}' <<<"${TEXT}")"
+    ISSUER="$(LC_ALL=C sed -n '/^Issuer: /{s/^Issuer: //p;q;}' <<<"${TEXT}")"
+    if LC_ALL=C grep -q 'CA:true' <<<"${TEXT}"; then
+        if [[ -n "${OWNER}" && "${OWNER}" == "${ISSUER}" ]]; then
+            printf 'root CA'
+        else
+            printf 'intermediate CA'
+        fi
+    elif [[ -n "${OWNER}" && "${OWNER}" == "${ISSUER}" ]]; then
+        printf 'end-entity (self-signed server cert)'
+    else
+        printf 'end-entity (server cert)'
+    fi
 }
 
 # tar アーカイブかどうかをマジックナンバーで判定する。
@@ -157,7 +193,7 @@ if [[ "${#CRT_FILES[@]}" -eq 0 ]]; then
     echo "         - docker build に証明書アーカイブを渡したか" >&2
     echo "             --secret id=cacerts,src=secrets/cacerts-bundle.tar" >&2
     echo "           (bash scripts/cacert-secret-args.sh がアーカイブごと生成する)" >&2
-    echo "         - アーカイブに <name>/cacert.crt が含まれているか" >&2
+    echo "         - アーカイブに <name>/<証明書ファイル> が含まれているか" >&2
     echo "             tar -tf secrets/cacerts-bundle.tar" >&2
     exit 1
 fi
@@ -234,6 +270,8 @@ TOTAL_FOUND=0
 TOTAL_IMPORTED=0
 SUMMARY=()
 declare -A SRC_SEQ=()
+# 種別ごとの枚数 (ルート CA / 中間 CA / エンドエンティティ) を数え、ログの最後に出す。
+declare -A KIND_COUNT=()
 
 for IDX in "${!CRT_FILES[@]}"; do
     CRT_FILE="${CRT_FILES[${IDX}]}"
@@ -246,36 +284,53 @@ for IDX in "${!CRT_FILES[@]}"; do
     echo "==> Source '${SRC_NAME}': ${SRC_LABEL}"
 
     # --------------------------------------------------------------
-    # 入力形式の判別
-    #   .crt は PEM / DER いずれの可能性もあるため、BEGIN CERTIFICATE 行の
-    #   有無で判定する (バイナリでも読めるよう grep -a を使用)。
-    #   - PEM: チェーンを 1 枚ずつに分割してから取り込む
-    #           (keytool -importcert は PEM 連結の 2 枚目以降を無視するため)
-    #   - DER: 1 ファイル 1 証明書。keytool がそのまま読める
+    # 入力形式の判別 (ファイル名・拡張子は見ない)
+    #   - PEM  : BEGIN CERTIFICATE 行の有無で判定 (バイナリでも読めるよう grep -a)。
+    #            チェーンが連結されていれば 1 枚ずつに分割してから取り込む
+    #            (keytool -importcert は PEM 連結の 2 枚目以降を無視するため)。
+    #   - それ以外 (DER 単体 / PKCS#7 バンドル):
+    #            keytool -printcert -rfc に通して PEM へ書き出す。-printcert は
+    #            X.509 単体・PKCS#7 のどちらも読め、-rfc で含まれる全証明書を
+    #            PEM 出力するため、ルート + 中間 (+ サーバ) が 1 ファイルに
+    #            束ねられていても取りこぼさない。以降は PEM と同じ経路で分割する。
     # --------------------------------------------------------------
+    SPLIT_SRC="${CRT_FILE}"
     if LC_ALL=C grep -qa -- '-----BEGIN CERTIFICATE-----' "${CRT_FILE}"; then
-        echo "==> Detected PEM (Base64) encoded certificate: ${SRC_LABEL}"
-        awk -v dir="${SPLIT_DIR}" '
-            /-----BEGIN CERTIFICATE-----/ { n++; write=1 }
-            write { print > sprintf("%s/cert-%02d", dir, n) }
-            /-----END CERTIFICATE-----/   { write=0 }
-        ' "${CRT_FILE}"
+        echo "==> Detected PEM (Base64) encoded certificate(s): ${SRC_LABEL}"
     else
-        echo "==> Detected DER (binary) encoded certificate: ${SRC_LABEL}"
-        cp "${CRT_FILE}" "${SPLIT_DIR}/cert-01"
+        echo "==> Detected DER / PKCS#7 encoded certificate(s): ${SRC_LABEL}"
+        SPLIT_SRC="${SPLIT_DIR}/converted.pem"
+        if ! keytool "${KEYTOOL_OPTS[@]}" -J-Duser.language=en -J-Duser.country=US \
+                -printcert -rfc -file "${CRT_FILE}" </dev/null > "${SPLIT_SRC}" 2>/dev/null \
+            || ! LC_ALL=C grep -qa -- '-----BEGIN CERTIFICATE-----' "${SPLIT_SRC}"; then
+            echo "ERROR: not a valid certificate file: ${SRC_LABEL}" >&2
+            echo "       PEM (-----BEGIN CERTIFICATE-----) / DER / PKCS#7 の" >&2
+            echo "       いずれかの証明書ファイルを渡しているか確認すること。" >&2
+            echo "       (ファイル名は任意だが、中身が証明書である必要がある)" >&2
+            exit 1
+        fi
     fi
+    awk -v dir="${SPLIT_DIR}" '
+        /-----BEGIN CERTIFICATE-----/ { n++; write=1 }
+        write { print > sprintf("%s/cert-%02d", dir, n) }
+        /-----END CERTIFICATE-----/   { write=0 }
+    ' "${SPLIT_SRC}"
 
     COUNT=0
     IMPORTED=0
     for CERT in "${SPLIT_DIR}"/cert-*; do
         [[ -e "${CERT}" ]] || break
 
-        # 取り込む前に証明書として解釈できるかを検証する。
+        # 取り込む前に証明書として解釈できるかを検証しつつ、内容を取得する。
         # (テキストだが証明書ではない / 壊れた DER などを早期に弾く)
-        if ! keytool "${KEYTOOL_OPTS[@]}" -printcert -file "${CERT}" </dev/null >/dev/null 2>&1; then
+        # keytool の出力はロケール依存のため、-J-Duser.language で英語に固定して
+        # 見出し (Owner/Issuer/Valid from) と BasicConstraints を安定させる。
+        CERT_TEXT=""
+        if ! CERT_TEXT="$(keytool "${KEYTOOL_OPTS[@]}" -J-Duser.language=en -J-Duser.country=US \
+                -printcert -file "${CERT}" </dev/null 2>/dev/null)"; then
             echo "ERROR: not a valid X.509 certificate: ${SRC_LABEL}" >&2
-            echo "       PEM (-----BEGIN CERTIFICATE-----) または DER 形式の" >&2
-            echo "       cacert.crt を渡しているか確認すること。" >&2
+            echo "       PEM (-----BEGIN CERTIFICATE-----) / DER / PKCS#7 形式の" >&2
+            echo "       証明書ファイルを渡しているか確認すること。" >&2
             exit 1
         fi
 
@@ -283,13 +338,13 @@ for IDX in "${!CRT_FILES[@]}"; do
         SEQ=$(( ${SRC_SEQ["${SRC_NAME}"]:-0} + 1 ))
         SRC_SEQ["${SRC_NAME}"]="${SEQ}"
         ALIAS="${SRC_NAME}-ca-${SEQ}"
-        echo "==> Importing certificate as alias '${ALIAS}'"
+        # 種別はログ表示と集計にのみ使う。トラストストアへの取り込み方は
+        # どの種別でも同じ (信頼済み証明書エントリとして 1 枚ずつ登録する)。
+        CERT_KIND="$(classify_certificate "${CERT_TEXT}")"
+        KIND_COUNT["${CERT_KIND}"]=$(( ${KIND_COUNT["${CERT_KIND}"]:-0} + 1 ))
+        echo "==> Importing certificate as alias '${ALIAS}' [${CERT_KIND}]"
         # どの証明書を焼き込んだかをビルドログに残す (有効期限の確認用)。
-        # keytool の出力はロケール依存のため、-J-Duser.language で英語に固定して
-        # 見出し (Owner/Issuer/Valid from) を安定させる。
-        keytool "${KEYTOOL_OPTS[@]}" -J-Duser.language=en -J-Duser.country=US \
-            -printcert -file "${CERT}" </dev/null \
-            | sed -n '/^Owner:/p; /^Issuer:/p; /^Valid from:/p'
+        sed -n '/^Owner:/p; /^Issuer:/p; /^Valid from:/p' <<<"${CERT_TEXT}"
 
         # -importcert も進捗を stderr に出すため、失敗時のみ内容を見せる。
         IMPORT_LOG=""
@@ -345,4 +400,8 @@ echo "------------------------------------------------------------------"
 echo "==> Done. ${TOTAL_IMPORTED} of ${TOTAL_FOUND} certificate(s) imported into ${OUT_STORE}"
 for LINE in "${SUMMARY[@]}"; do
     echo "      ${LINE}"
+done
+echo "==> Certificate kinds found:"
+for KIND in "${!KIND_COUNT[@]}"; do
+    echo "      ${KIND}: ${KIND_COUNT[${KIND}]}"
 done

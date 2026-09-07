@@ -7,8 +7,11 @@ extraslb (自己署名証明書) をはじめとする複数の提供元を経�
 採用方式: **ベースイメージへの証明書埋め込み (BuildKit Secrets)**。
 他方式との比較・移行方針は [docs/certificate-management-strategies.md](docs/certificate-management-strategies.md) を参照。
 
-証明書は提供元ごとに `secrets/certs/<name>/cacert.crt` として配置し、
+証明書は提供元ごとに `secrets/certs/<name>/` へ置き、
 `certs` ディレクトリ配下をまとめて **1 つの BuildKit Secret (`id=cacerts`)** として渡す。
+**ファイル名・拡張子は問わず** (`cacert.crt` でなくてよい)、
+ルート CA / 中間 CA / サーバ証明書のいずれも、PEM / DER / PKCS#7 のどの形式でも受け付ける
+(→ [受け付ける証明書](#受け付ける証明書))。
 **複数ソースを 1 つのトラストストアへまとめて取り込む**ため、
 ソースが増えても Dockerfile / docker build コマンド / JBoss CLI / entrypoint の
 いずれも変更不要 (→ [証明書ソースを追加する手順](#証明書ソースを追加する手順))。
@@ -19,12 +22,13 @@ extraslb (自己署名証明書) をはじめとする複数の提供元を経�
 secrets/                               # 受領した証明書の置き場 (コミット禁止・.gitignore 済み)
   certs/                               #   ここより下がまとめて 1 つのシークレットになる
     extraslb/cacert.crt                #     提供元ごとにディレクトリを分ける
-    others/cacert.crt                  #     ディレクトリ名がトラストストア上のエイリアス接頭辞になる
+    others/rootCA.pem                  #     ディレクトリ名がトラストストア上のエイリアス接頭辞になる
+                                       #     (ファイル名は任意。1 ディレクトリに複数枚置いてもよい)
   cacerts-bundle.tar                   #   ヘルパーが生成する受け渡し用アーカイブ (ビルド後は削除可)
 scripts/cacert-secret-args.sh          # secrets/certs を 1 つの tar にまとめ docker build の --secret 引数を生成
 base/                                  # ベースイメージ (証明書関連を一元管理)
   Dockerfile                           # BuildKit Secret 1 つ (id=cacerts) を受け取りトラストストア生成
-  scripts/build-truststore.sh          # cacerts ベースの PKCS12 トラストストア組み立て (アーカイブ展開・複数ソース・PEM/DER 自動判別・チェーン対応)
+  scripts/build-truststore.sh          # cacerts ベースの PKCS12 トラストストア組み立て (アーカイブ展開・複数ソース・PEM/DER/PKCS#7 自動判別・チェーン分割)
   scripts/entrypoint.sh                # 起動時: JBoss CLI 実行 → JVM プロパティ付きで EAP 起動
   jboss-cli/configure-outbound-tls.cli # Elytron の key-store / trust-manager / client-ssl-context 定義
 front/Dockerfile                       # ベースを継承し WAR を配置するだけ
@@ -51,23 +55,45 @@ JVM システムプロパティ側・Elytron 側のどちらにも同時に反�
 > アプリ側で `SSLContext` やトラストストアを明示的に自前構築している場合は、
 > 同パス (`EXTRASLB_TRUSTSTORE_PATH` 環境変数で参照可) を読むように実装すること。
 
+## 受け付ける証明書
+
+**判定はすべてファイルの中身に対して行う。ファイル名・拡張子は一切見ない。**
+
+| 観点 | 受け付けるもの |
+|------|----------------|
+| ファイル名 | 任意 (`cacert.crt` / `rootCA.pem` / `ca.cer` / 拡張子なし …)。証明書でないファイル (README 等) は警告を出して読み飛ばす |
+| 形式 | PEM (Base64 テキスト) / DER (バイナリ) / PKCS#7 バンドル (`.p7b`・`.p7c` 相当、DER・PEM どちらの包装でも可) |
+| 枚数 | 1 ファイルに複数枚 (PEM 連結チェーン・PKCS#7) が入っていても 1 枚ずつに分割して全て取り込む。1 ソースディレクトリに複数ファイルを置いてもよい |
+| 種別 | ルート CA / 中間 CA / サーバ (エンドエンティティ) 証明書のいずれも可 |
+
+証明書の**種別による使い分け** (取り込み方法はどれも同じで、信頼範囲だけが変わる):
+
+| 種別 | 効果 | 使いどころ |
+|------|------|-----------|
+| ルート CA | その CA が発行した全サーバ証明書を信頼する | 通常はこれ。サーバ証明書が更新されても再ビルド不要 |
+| 中間 CA | その中間 CA 配下だけを信頼する | サーバがチェーンを提示しない場合、信頼範囲を絞りたい場合 |
+| サーバ証明書 | その 1 枚だけを信頼する (証明書ピンニング) | 自己署名サーバ証明書、CA が入手できない場合。**サーバ証明書の更新のたびに再ビルドが必要** |
+
+> サーバ証明書 (リーフ) をトラストストアに入れる方式が成立するのは、Java の PKIX 実装が
+> 「提示されたチェーンの中に信頼済み証明書があればそこを信頼アンカーとして扱う」ためで、
+> 中間 CA 1 枚だけを入れた場合も同じ理屈で検証が通る (JDK 17 で実測確認済み)。
+
 ## ビルド手順
 
-入力は提供元ごとの CA 証明書 **`cacert.crt`**。`secrets/certs/<name>/cacert.crt` の構成で配置する。
-`.crt` は PEM (Base64 テキスト) / DER (バイナリ) のどちらの形式でもよく、
-`build-truststore.sh` がファイルの中身を見てソースごとに自動判別する (拡張子では判定しない)。
-PEM でチェーンが連結されている場合は全証明書を取り込む。
+入力は提供元ごとの CA 証明書 / サーバ証明書。`secrets/certs/<name>/` 配下へ置く
+(ファイル名は任意、形式は `build-truststore.sh` が中身を見て自動判別する)。
 
 ```bash
-# 0. 各提供元から受領した cacert.crt を配置
+# 0. 各提供元から受領した証明書を配置
 #    ※ secrets/ はリポジトリにコミットしないこと (.gitignore 済み)
+#    ※ ファイル名は何でもよい。1 ディレクトリに複数枚置いてもまとめて取り込まれる
 mkdir -p secrets/certs/extraslb secrets/certs/others
 cp /path/to/extraslb-cacert.crt secrets/certs/extraslb/cacert.crt
-cp /path/to/others-cacert.crt   secrets/certs/others/cacert.crt
+cp /path/to/others-chain.p7b    secrets/certs/others/others-chain.p7b
 
 # 形式の事前確認 (任意)
-file secrets/certs/extraslb/cacert.crt                     # "PEM certificate" or "data" (DER)
-keytool -printcert -file secrets/certs/extraslb/cacert.crt # PEM/DER どちらでも内容を表示できる
+file secrets/certs/extraslb/cacert.crt                     # "PEM certificate" or "data" (DER/PKCS#7)
+keytool -printcert -file secrets/certs/extraslb/cacert.crt # PEM/DER/PKCS#7 どれでも内容を表示できる
 
 # 1. registry.redhat.io へログイン (EAP 8.1 イメージ取得に必要)
 docker login registry.redhat.io
@@ -82,7 +108,7 @@ DOCKER_BUILDKIT=1 docker build \
 
 #    ヘルパーを使わない場合 (やっていることは同じ)
 #    ※ certs 配下を丸ごと固めるため、証明書以外のファイル (README, .DS_Store 等) を
-#      置かないこと。ヘルパーは *.crt / *.pem だけを選んで固める。
+#      置かないこと。ヘルパー経由なら中身を見て証明書だけを選んで固めるので不要。
 tar -cf secrets/cacerts-bundle.tar -C secrets/certs .
 DOCKER_BUILDKIT=1 docker build \
   --secret id=cacerts,src=secrets/cacerts-bundle.tar \
@@ -117,7 +143,7 @@ rm -rf secrets     # 証明書と受け渡し用 tar をまとめて破棄
 
 **配置するだけでよい** (例: `newsvc` を追加する場合):
 
-1. `secrets/certs/newsvc/cacert.crt` を配置する
+1. `secrets/certs/newsvc/` へ証明書ファイルを置く (ファイル名は任意、複数枚可)
 2. 上記「2.」のコマンドでベースイメージをビルドし直す
 
 `base/Dockerfile` も `docker build` コマンドも変更不要。
@@ -141,11 +167,12 @@ rm -rf secrets     # 証明書と受け渡し用 tar をまとめて破棄
 
 | 決めごと | 内容 |
 |----------|------|
-| ディレクトリ名 = ソース名 | `secrets/certs/<name>/cacert.crt` |
+| ディレクトリ名 = ソース名 | `secrets/certs/<name>/<任意のファイル名>` |
 | シークレット ID | `cacerts` (固定・1 つだけ) |
-| マウント先 | `/run/secrets/cacerts.tar` (中身は `<name>/cacert.crt`) |
-| トラストストア上のエイリアス | `<name>-ca-1`, `<name>-ca-2`, … (PEM チェーンは 1 枚ずつ連番) |
-| 1 ソースに複数ファイル | `<name>/` 直下の `*.crt` / `*.pem` を全て取り込み、連番は継続する |
+| マウント先 | `/run/secrets/cacerts.tar` (中身は `<name>/<ファイル>`) |
+| トラストストア上のエイリアス | `<name>-ca-1`, `<name>-ca-2`, … (チェーンは 1 枚ずつ連番。種別に関わらず `-ca-` 接頭辞) |
+| 1 ソースに複数ファイル | `<name>/` 直下の証明書ファイルを全て取り込み、連番は継続する |
+| ファイル名で絞り込みたい場合 | `CERT_GLOBS='*.crt *.pem' bash scripts/cacert-secret-args.sh` (既定は名前で絞らない) |
 
 ## 動作確認
 
@@ -157,7 +184,19 @@ rm -rf secrets     # 証明書と受け渡し用 tar をまとめて破棄
 ```
 ==> Done. 3 of 3 certificate(s) imported into /opt/app/security/extraslb-truststore.p12
       extraslb: 2 imported / 0 skipped (duplicate) <- extraslb/cacert.crt
-      others: 1 imported / 0 skipped (duplicate) <- others/cacert.crt
+      others: 1 imported / 0 skipped (duplicate) <- others/others-chain.p7b
+==> Certificate kinds found:
+      root CA: 2
+      intermediate CA: 1
+```
+
+各証明書は取り込み時に種別付きで出力されるので、意図した証明書が入ったかを確認できる:
+
+```
+==> Importing certificate as alias 'extraslb-ca-1' [root CA]
+Owner: CN=Test Root CA, O=ExtraSLB
+Issuer: CN=Test Root CA, O=ExtraSLB
+Valid from: ... until: ...
 ```
 
 ```bash
@@ -224,7 +263,7 @@ CMD        ["/usr/local/bin/entrypoint.sh"]       # 2. Elytron 設定 + 履歴�
 
 ## 証明書ローテーション時の手順
 
-1. 提供元から新しい `cacert.crt` を受領し、CI の一次保管場所 (Parameter Store 等) を更新
+1. 提供元から新しい証明書を受領し、CI の一次保管場所 (Parameter Store 等) を更新
    (更新するのは該当ソースのパラメータのみ。他ソースの証明書はそのまま)
 2. ベースイメージを再ビルド → フロント / バックを再ビルド
 3. ECS サービスを新イメージでローリングデプロイ

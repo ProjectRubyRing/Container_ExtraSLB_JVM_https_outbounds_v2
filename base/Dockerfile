@@ -2,14 +2,17 @@
 #
 # ベースコンテナ: JBoss EAP 8.1 + 自己署名 CA 証明書入りトラストストア
 #
-# ビルド方法 (BuildKit Secrets で証明書を渡す。イメージレイヤーに cacert.crt 自体は残らない):
+# ビルド方法 (BuildKit Secrets で証明書を渡す。イメージレイヤーに証明書自体は残らない):
 #   DOCKER_BUILDKIT=1 docker build \
 #     $(bash scripts/cacert-secret-args.sh) \
 #     -t eap81-extraslb-base:1.0 \
 #     base/
 #
-# 入力は各提供元から受領した CA 証明書 cacert.crt (PEM / DER どちらでも可)。
-# 提供元ごとに secrets/certs/<name>/cacert.crt として配置する。
+# 入力は各提供元から受領した証明書 (PEM / DER / PKCS#7 のいずれでも可)。
+# 提供元ごとに secrets/certs/<name>/ 配下へ置くだけでよく、
+# **ファイル名・拡張子は問わない** (cacert.crt / rootCA.pem / ca.cer / 拡張子なし ...)。
+# ルート CA / 中間 CA / サーバ証明書のいずれも、また 1 ファイルにチェーンが
+# 束ねられていても、build-truststore.sh が中身を見て 1 枚ずつ取り込む。
 # certs ディレクトリ配下がまとめて 1 つのシークレット (id=cacerts) として
 # 渡されるため、提供元が増えても本 Dockerfile の変更は不要。
 #
@@ -48,14 +51,16 @@ RUN chmod 0755 /usr/local/bin/build-truststore.sh /usr/local/bin/entrypoint.sh
 # (id=cacerts)** として受け取り、JDK 標準の cacerts をベースにした
 # 1 つのトラストストアへ取り込む。
 #   - cacerts をコピー元にするため、パブリック CA 宛の通信も引き続き可能
-#   - cacert.crt の PEM / DER 判定は build-truststore.sh が中身を見て行う
+#   - ファイル名に依存せず、PEM / DER / PKCS#7 の判定と
+#     チェーンの分割は build-truststore.sh が中身を見て行う
 #   - secret は RUN 実行中のみマウントされ、イメージには truststore のみ残る
 #
 # 【証明書ソースの追加手順】(例: newsvc を追加する場合)
-#   1. ビルドコンテキスト側に secrets/certs/newsvc/cacert.crt を配置する
+#   1. ビルドコンテキスト側の secrets/certs/newsvc/ へ証明書を配置する
+#      (ファイル名は任意)
 #   2. そのままビルドし直す (本 Dockerfile も docker build コマンドも変更不要)
 #
-#   ※ certs ディレクトリ配下の <name>/cacert.crt がそのままソースになり、
+#   ※ certs ディレクトリ配下の <name>/ 直下のファイルがそのままソースになり、
 #      ディレクトリ名がトラストストア上のエイリアス接頭辞
 #      (newsvc-ca-1, newsvc-ca-2, ...) になる。
 #   ※ BuildKit のシークレットはディレクトリをマウントできない
