@@ -29,6 +29,7 @@ scripts/cacert-secret-args.sh          # secrets/certs を 1 つの tar にま�
 base/                                  # ベースイメージ (証明書関連を一元管理)
   Dockerfile                           # BuildKit Secret 1 つ (id=cacerts) を受け取りトラストストア生成
   scripts/build-truststore.sh          # cacerts ベースの PKCS12 トラストストア組み立て (アーカイブ展開・複数ソース・PEM/DER/PKCS#7 自動判別・チェーン分割)
+  scripts/provision-application-keystore.sh  # インバウンド HTTPS 用キーストアの事前生成 (WFLYELY00023 抑制)
   scripts/entrypoint.sh                # 起動時: JBoss CLI 実行 → JVM プロパティ付きで EAP 起動
   jboss-cli/configure-outbound-tls.cli # Elytron の key-store / trust-manager / client-ssl-context 定義
 front/Dockerfile                       # ベースを継承し WAR を配置するだけ
@@ -37,6 +38,7 @@ docs/certificate-management-strategies.md
 docs/standalone-xml-history-ecs-vs-compose.md   # ECS だけ異常終了する履歴ローテーション問題の原因と修正
 docs/shortest-fix-safety-analysis.md            # 「最短の打ち手」の安全性・十分性の論理検証
 docs/minimal-fix-rm-history-only.md             # 「rm -rf standalone_xml_history の 1 行だけ」で足りるかの要約
+docs/wflyely00023-application-keystore.md       # WFLYELY00023 (application.keystore does not exist) の原因・無害性の実測・抑制
 ```
 
 ## 信頼設定の 2 層構え (どの HTTP クライアントでも動作させるため)
@@ -54,6 +56,32 @@ JVM システムプロパティ側・Elytron 側のどちらにも同時に反�
 
 > アプリ側で `SSLContext` やトラストストアを明示的に自前構築している場合は、
 > 同パス (`EXTRASLB_TRUSTSTORE_PATH` 環境変数で参照可) を読むように実装すること。
+
+### インバウンド HTTPS 用キーストア (`WFLYELY00023` 対策)
+
+上表はいずれも**アウトバウンド**の設定である。これとは別に、EAP の標準
+`standalone.xml` には**インバウンド** (8443) 用の `applicationKS` /
+`applicationKM` / `applicationSSC` が最初から入っており、その実体ファイル
+`standalone/configuration/application.keystore` は**同梱されていない**。
+Elytron の `key-store` サービスは誰も参照していなくてもブートごとに起動するため、
+ファイルが無い間は毎起動この警告が出る。
+
+```
+WARN [org.wildfly.extension.elytron] WFLYELY00023:
+     KeyStore file '.../standalone/configuration/application.keystore' does not exist. Used blank.
+```
+
+**アウトバウンド HTTPS には影響しない** (自己署名証明書経由もパブリック CA 経由も
+同一ブート上で疎通を実測確認済み)。ただしログが毎回汚れ、`readonlyRootFilesystem=true`
+では 8443 の自己署名証明書の遅延生成が失敗するため、
+**EAP が自動生成するはずのキーストアをビルド時に先に作ってイメージへ入れる**
+ことで原因ごと解消している (ログの握りつぶしはしない)。
+
+- ビルド時: `base/Dockerfile` (`--build-arg PROVISION_APPLICATION_KEYSTORE=false` で無効化)
+- 起動時: `entrypoint.sh` が取りこぼしを補完 (`EXTRASLB_APP_KEYSTORE_MODE=skip` で無効化)
+
+原因の詳細・実測記録・不採用案は
+[docs/wflyely00023-application-keystore.md](docs/wflyely00023-application-keystore.md) を参照。
 
 ## 受け付ける証明書
 
@@ -208,6 +236,11 @@ docker run --rm --entrypoint bash eap81-extraslb-base:1.0 -c \
   'ls /run/secrets/ 2>/dev/null; echo "(空であること)"'
 docker history eap81-extraslb-base:1.0   # cacert.crt の COPY レイヤーが無いこと
 
+# インバウンド HTTPS 用キーストアが埋め込まれていること (WFLYELY00023 が出なくなる)
+docker run --rm --entrypoint bash eap81-extraslb-base:1.0 -c \
+  'keytool -list -keystore $JBOSS_HOME/standalone/configuration/application.keystore \
+     -storepass password | grep server'
+
 # 起動時の JBoss CLI 適用と EAP 起動
 docker run --rm -p 8080:8080 myapp-front:1.0
 #   → ログに "Applying Elytron outbound TLS configuration" と CLI の success が出力される
@@ -234,6 +267,7 @@ docker exec <container> $JBOSS_HOME/bin/jboss-cli.sh -c \
 | `EXTRASLB_HISTORY_AUTO_RECREATE` | `true` | `rename(2)` が通らないと実測できた場合にだけ履歴ツリーを自動で作り直す (overlayfs の merged ディレクトリ対策) |
 | `EXTRASLB_STRICT_PREFLIGHT` | `true` | 書き込み検証の失敗で起動を止めるか |
 | `EXTRASLB_TMP_DIR` | (自動選択) | CLI 一時ファイルの置き場所 (`/tmp` が read-only な環境向け) |
+| `EXTRASLB_APP_KEYSTORE_MODE` | `auto` | インバウンド HTTPS 用キーストア (`application.keystore`) が無ければ EAP と同じ内容で生成し `WFLYELY00023` を出さなくする。`skip` = 何もしない |
 
 > `EXTRASLB_TLS_CONFIG_MODE` / `EXTRASLB_HISTORY_MODE` は、
 > **configuration-seed 方式と併用したときに ECS だけ異常終了する**問題への対応で追加したもの。

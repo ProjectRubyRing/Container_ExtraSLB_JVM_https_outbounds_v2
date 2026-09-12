@@ -5,7 +5,9 @@
 #      トラストストア / client-ssl-context を設定
 #   2. embed-server が作った standalone_xml_history を「安全な形」へ正規化
 #      (★ これを行わないと本ブートが異常終了し得る。理由は下記)
-#   3. JVM システムプロパティ (javax.net.ssl.*) を付与して EAP を起動
+#   3. インバウンド HTTPS 用キーストア (application.keystore) の取りこぼしを補完
+#      (ベースイメージでビルド時に生成済みなら何もしない。WFLYELY00023 対策)
+#   4. JVM システムプロパティ (javax.net.ssl.*) を付与して EAP を起動
 #
 # トラストストアは extraslb / others など複数ソースの CA 証明書をビルド時に
 # 1 ファイルへまとめたもの。証明書ソースが増えても本スクリプトの変更は不要。
@@ -59,6 +61,15 @@
 #   EXTRASLB_STRICT_PREFLIGHT     true (既定) | false
 #                                 false にすると書き込み検証の失敗を警告に留める
 #   EXTRASLB_TMP_DIR              CLI 一時ファイルの置き場所 (既定: 自動選択)
+#   EXTRASLB_APP_KEYSTORE_MODE    auto (既定) | skip
+#                                 auto = サーバ設定が参照するインバウンド HTTPS 用
+#                                        キーストア (既定 application.keystore) が
+#                                        無ければ EAP と同じ内容で生成し、
+#                                        WFLYELY00023 / WFLYELY01084 を出さなくする
+#                                        (ベースイメージのビルド時に生成済みなら no-op)
+#                                 skip = 何もしない
+#                                        (警告は出るが通信への影響は無い。
+#                                         docs/wflyely00023-application-keystore.md)
 set -euo pipefail
 
 JBOSS_HOME="${JBOSS_HOME:-/opt/server}"
@@ -78,13 +89,20 @@ EXTRASLB_TLS_CONFIG_MODE="${EXTRASLB_TLS_CONFIG_MODE:-auto}"
 EXTRASLB_HISTORY_MODE="${EXTRASLB_HISTORY_MODE:-rotate}"
 EXTRASLB_HISTORY_AUTO_RECREATE="${EXTRASLB_HISTORY_AUTO_RECREATE:-true}"
 EXTRASLB_STRICT_PREFLIGHT="${EXTRASLB_STRICT_PREFLIGHT:-true}"
+EXTRASLB_APP_KEYSTORE_MODE="${EXTRASLB_APP_KEYSTORE_MODE:-auto}"
 
 case "${EXTRASLB_HISTORY_MODE}" in
     rotate|recreate|purge|off) ;;
     *) echo "==> [entrypoint] FATAL: EXTRASLB_HISTORY_MODE の値が不正です: '${EXTRASLB_HISTORY_MODE}' (rotate|recreate|purge|off)" >&2; exit 1 ;;
 esac
 
+case "${EXTRASLB_APP_KEYSTORE_MODE}" in
+    auto|skip) ;;
+    *) echo "==> [entrypoint] FATAL: EXTRASLB_APP_KEYSTORE_MODE の値が不正です: '${EXTRASLB_APP_KEYSTORE_MODE}' (auto|skip)" >&2; exit 1 ;;
+esac
+
 CLI_SCRIPT="${EXTRASLB_CLI_SCRIPT:-/opt/app/cli/configure-outbound-tls.cli}"
+APP_KEYSTORE_SCRIPT="${EXTRASLB_APP_KEYSTORE_SCRIPT:-/usr/local/bin/provision-application-keystore.sh}"
 
 # standalone.xml に設定が入っているかを判定するためのマーカー。
 # configure-outbound-tls.cli が必ず追加するリソース名を使う。
@@ -477,7 +495,50 @@ else
 fi
 
 # ------------------------------------------------------------------
-# 5. EAP 起動
+# 5. インバウンド (サーバ側) HTTPS 用キーストアの補完
+#
+#    【対象の警告】
+#      WARN [org.wildfly.extension.elytron] WFLYELY00023:
+#           KeyStore file '.../configuration/application.keystore'
+#           does not exist. Used blank.
+#      WARN [org.wildfly.extension.elytron] WFLYELY01084:
+#           KeyStore ... not found, it will be auto-generated on first use ...
+#
+#    本プロジェクトが設定するアウトバウンド TLS (extraslb-trust-store /
+#    extraslb-client-ssl-context / default-ssl-context) とは **無関係**で、
+#    EAP 標準設定の applicationKS (インバウンド 8443 用のサーバ鍵ストア) が
+#    出している。実体ファイルは同梱されず初回 HTTPS 接続時に遅延生成される
+#    一方、Elytron の key-store サービスは誰も参照していなくてもブートごとに
+#    ACTIVE で起動するため、ファイルが無い間は毎起動出続ける。
+#    通信影響が無いことの検証記録:
+#      docs/wflyely00023-application-keystore.md
+#
+#    【ここで行うこと】
+#    ベースイメージのビルド時 (base/Dockerfile の
+#    PROVISION_APPLICATION_KEYSTORE) に生成済みであれば何もしない。
+#    次のような「イメージの configuration がそのまま使われない」ケースで
+#    取りこぼしを補完するためにここでも呼ぶ:
+#      - configuration-seed 方式や外部ボリュームで configuration を差し替えた
+#      - SERVER_CONFIG にビルド時と異なる設定ファイルを指定した
+#      - APPLY_TLS_CONFIG_AT_BUILD=false で作ったベースを使っている
+#
+#    ★ この呼び出しは EAP 起動より前でなければ意味が無い。
+#      警告はブート中の key-store サービス起動時に出るため、
+#      その時点でファイルが存在している必要がある。
+#    ★ 失敗しても起動は止めない (元々「警告が出るだけ」の事象であり、
+#      対処の失敗がそれより重い障害になっては本末転倒なため)。
+# ------------------------------------------------------------------
+if [[ "${EXTRASLB_APP_KEYSTORE_MODE}" == "skip" ]]; then
+    say "EXTRASLB_APP_KEYSTORE_MODE=skip: インバウンド HTTPS 用キーストアの補完を行いません"
+elif [[ -x "${APP_KEYSTORE_SCRIPT}" ]]; then
+    "${APP_KEYSTORE_SCRIPT}" "${CONF_DIR}/${SERVER_CONFIG}" || \
+        warn "インバウンド HTTPS 用キーストアの補完に失敗しました (WFLYELY00023 が出ますが通信影響はありません)"
+else
+    warn "${APP_KEYSTORE_SCRIPT} が実行できないため、インバウンド HTTPS 用キーストアの補完をスキップします"
+fi
+
+# ------------------------------------------------------------------
+# 6. EAP 起動
 #    javax.net.ssl.* は standalone.sh のサーバ引数として渡すと
 #    サーバプロセスのシステムプロパティとして起動初期に設定される。
 #    (JAVA_OPTS を直接上書きしないため、イメージ既定のメモリ設定等を壊さない)

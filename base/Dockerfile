@@ -42,9 +42,12 @@ USER root
 # ビルド用スクリプト・起動スクリプト・JBoss CLI 定義を配置
 COPY scripts/build-truststore.sh /usr/local/bin/build-truststore.sh
 COPY scripts/entrypoint.sh       /usr/local/bin/entrypoint.sh
+COPY scripts/provision-application-keystore.sh /usr/local/bin/provision-application-keystore.sh
 COPY jboss-cli/configure-outbound-tls.cli /opt/app/cli/configure-outbound-tls.cli
 
-RUN chmod 0755 /usr/local/bin/build-truststore.sh /usr/local/bin/entrypoint.sh
+RUN chmod 0755 /usr/local/bin/build-truststore.sh \
+               /usr/local/bin/entrypoint.sh \
+               /usr/local/bin/provision-application-keystore.sh
 
 # ==================================================================
 # BuildKit Secrets で全提供元の CA 証明書を **1 つのシークレット
@@ -85,6 +88,51 @@ RUN --mount=type=secret,id=cacerts,target=/run/secrets/cacerts.tar,required=true
     && chmod 0444 "${EXTRASLB_TRUSTSTORE_PATH}"
 
 # ==================================================================
+# インバウンド (サーバ側) HTTPS 用キーストアの事前生成
+#   -> WFLYELY00023 / WFLYELY01084 の抑制
+#
+# 【出ていた警告】
+#   WARN [org.wildfly.extension.elytron] WFLYELY00023:
+#        KeyStore file '.../standalone/configuration/application.keystore'
+#        does not exist. Used blank.
+#
+# 【原因】本プロジェクトのアウトバウンド TLS 設定とは無関係で、EAP の
+#   標準 standalone.xml が持つ applicationKS (インバウンド HTTPS 用の
+#   サーバ鍵ストア) が原因。実体ファイル application.keystore は
+#   ディストリビューションに同梱されず「初回の 8443 ハンドシェイク時に
+#   遅延生成」される一方、Elytron の key-store サービスは誰も参照して
+#   いなくてもブートのたびに ACTIVE で起動するため、ファイルが無い間は
+#   毎起動この警告が出る。コンテナは起動のたびにイメージの初期状態へ戻る
+#   ので、放置すると永久に出続ける。
+#
+# 【対処】EAP が自分で作るはずだったものと同じ内容 (alias=server /
+#   CN=localhost / RSA2048 / SHA256withRSA / 3650 日 / JKS) を
+#   ビルド時に作って埋め込む。ログを握りつぶさずに原因ごと無くす方法で、
+#   さらに次の副次的な利点がある。
+#     - readonlyRootFilesystem=true でも 8443 が使える
+#       (遅延生成は configuration へ書き込めないと失敗する)
+#     - タスクごとに別々の自己署名証明書ができる非決定性が無くなる
+#     - この RUN を Elytron 設定 (embed-server) より **前** に置いてあるので、
+#       ビルドログからも同じ警告が消える
+#
+#   PROVISION_APPLICATION_KEYSTORE=false で無効化できる。無効にしても
+#   警告が出るだけで通信への影響は無い (詳細と検証記録:
+#   docs/wflyely00023-application-keystore.md)。
+# ==================================================================
+ARG PROVISION_APPLICATION_KEYSTORE=true
+ARG RUN_UID=185
+ARG RUN_GID=0
+
+RUN set -eu; \
+    CONF_DIR="${JBOSS_HOME:-/opt/server}/standalone/configuration"; \
+    if [ "${PROVISION_APPLICATION_KEYSTORE}" = "true" ]; then \
+        /usr/local/bin/provision-application-keystore.sh \
+            "${CONF_DIR}/standalone.xml" "${RUN_UID}:${RUN_GID}"; \
+    else \
+        echo "[base] PROVISION_APPLICATION_KEYSTORE=false: application.keystore を生成しません (WFLYELY00023 が出ます)" >&2; \
+    fi
+
+# ==================================================================
 # Elytron 設定の「ビルド時適用」と standalone_xml_history の掃除
 #
 # 【なぜビルド時に適用するのか】
@@ -122,9 +170,8 @@ RUN --mount=type=secret,id=cacerts,target=/run/secrets/cacerts.tar,required=true
 #   リンク先の EFS がまだ存在しないビルド時にリンク化されていると失敗する。
 # ==================================================================
 ARG APPLY_TLS_CONFIG_AT_BUILD=true
-# 実行ユーザー。ビルド時に root で書き換えた設定ファイルの所有権を戻すために使う
-ARG RUN_UID=185
-ARG RUN_GID=0
+# 実行ユーザー (RUN_UID / RUN_GID) は上のキーストア生成ブロックで宣言済み。
+# ビルド時に root で書き換えた設定ファイルの所有権を戻すために使う。
 
 RUN set -eu; \
     CONF_DIR="${JBOSS_HOME:-/opt/server}/standalone/configuration"; \
